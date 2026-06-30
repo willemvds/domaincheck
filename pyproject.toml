@@ -1,0 +1,21 @@
+[project]
+name = "domaincheck"
+version = "0.1.0"
+description = "Tools for checking up on domains."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "cryptography>=46.0.3",
+    "h2>=4.3.0",
+    "hpack>=4.1.0",
+]
+
+[dependency-groups]
+dev = [
+    "black>=25.11.0",
+    "ruff>=0.14.5",
+    "ty>=0.0.51",
+]
+
+[tool.uv.build-backend]
+module-root = "src"
