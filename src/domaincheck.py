@@ -13,12 +13,17 @@ from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 import h2.connection
 import h2.events
-import hpack.struct
+import h11
 
 import strencodings
 
 MS_PER_S = 1000  # Milliseconds per Second
 NetAddr = typing.Tuple[str, int]
+
+# Neutral header shape shared by the h2 and http/1.1 paths so that
+# Report.response_headers does not depend on a protocol-specific format
+# (hpack.struct.Header is HTTP/2-only, h11.Headers is HTTP/1.1-only).
+Headers = list[tuple[bytes, bytes]]
 
 
 class HTTPVersion(enum.Enum):
@@ -35,7 +40,7 @@ class Report:
     cert: x509.Certificate
     tls_connect_ms: int
     http_response_ms: int
-    response_headers: list[hpack.struct.Header] 
+    response_headers: Headers
     body: str
 
 
@@ -83,28 +88,13 @@ def print_cert_info(cert: x509.Certificate):
     print(f"Public key: {public_key}")
 
 
-def web(fqdn: str, port: int = 443) -> Report:
-    ip_list = ips(fqdn)
-    ip = ip_list[0]
-    # ip, port = addr
+def _h2_roundtrip(
+    tls_sock: ssl.SSLSocket, host: str
+) -> tuple[Headers, bytes, float, float]:
+    """Perform an HTTP/2 GET / over an established TLS socket.
 
-    # context = ssl.create_default_context()
-    context = ssl._create_unverified_context()
-    context.set_alpn_protocols(["h2", "http/1.1"])
-    sock = socket.socket(socket.AF_INET)
-    tls_sock = context.wrap_socket(sock, server_hostname=fqdn)
-
-    socket_started_at = time.monotonic()
-    tls_sock.connect((ip, port))
-    socket_connected_at = time.monotonic()
-    c = tls_sock.getpeercert(binary_form=True)
-    if c is None:
-        raise Exception("no cert found")
-    cert = x509.load_der_x509_certificate(c, default_backend())
-
-    # negotiated_protocol = tls_sock.selected_alpn_protocol()
-    # print(f"negotiated protocol = {negotiated_protocol}")
-
+    Returns (response_headers, body, request_sent_at, response_received_at).
+    """
     c2 = h2.connection.H2Connection()
     c2.initiate_connection()
 
@@ -114,14 +104,14 @@ def web(fqdn: str, port: int = 443) -> Report:
     headers = [
         (":method", "GET"),
         (":path", "/"),
-        (":authority", fqdn),
+        (":authority", host),
         (":scheme", "https"),
     ]
     c2.send_headers(1, headers, end_stream=True)
     tls_sock.sendall(c2.data_to_send())
 
     body = b""
-    response_headers: list[hpack.struct.Header] = []
+    response_headers: Headers = []
     response_stream_ended = False
     while not response_stream_ended:
         data = tls_sock.recv(65536)
@@ -150,13 +140,122 @@ def web(fqdn: str, port: int = 443) -> Report:
     tls_sock.sendall(c2.data_to_send())
     tls_sock.close()
 
+    return response_headers, body, request_sent_at, response_received_at
+
+
+def _http1_roundtrip(
+    tls_sock: ssl.SSLSocket, host: str
+) -> tuple[Headers, bytes, float, float]:
+    """Perform an HTTP/1.1 GET / over an established TLS socket using h11.
+
+    Returns (response_headers, body, request_sent_at, response_received_at).
+    """
+    client = h11.Connection(our_role=h11.CLIENT)
+
+    request = h11.Request(
+        method="GET",
+        target="/",
+        headers=[
+            (b"host", host.encode(strencodings.UTF8)),
+            (b"user-agent", b"domaincheck"),
+            (b"accept", b"*/*"),
+            (b"connection", b"close"),
+        ],
+    )
+
+    request_sent_at = time.monotonic()
+    # h11.Connection.send() returns the bytes to put on the wire (or
+    # None for events that don't immediately produce wire bytes).
+    # EndOfMessage finalises the request framing (empty body -> just
+    # headers + terminating blank line).
+    out = b""
+    chunk = client.send(request)
+    if chunk is not None:
+        out += chunk
+    chunk = client.send(h11.EndOfMessage())
+    if chunk is not None:
+        out += chunk
+    tls_sock.sendall(out)
+
+    body = b""
+    response_headers: Headers = []
+    response_done = False
+    while not response_done:
+        event = client.next_event()
+        if event is h11.NEED_DATA:
+            data = tls_sock.recv(65536)
+            # Feeding b"" on EOF lets h11 surface a RemoteProtocolError
+            # (or finish streaming a completed response) on the next
+            # next_event() call. We then loop back; if it still returns
+            # NEED_DATA we bail below.
+            client.receive_data(data)
+            if not data:
+                break
+            continue
+        if event is h11.PAUSED:
+            # Shouldn't happen for a simple client GET; bail defensively.
+            break
+        if isinstance(event, h11.InformationalResponse):
+            # 1xx interim responses are not the final answer; keep going.
+            continue
+        if isinstance(event, h11.Response):
+            response_headers = list(event.headers)
+        elif isinstance(event, h11.Data):
+            body += event.data
+        elif isinstance(event, h11.EndOfMessage):
+            response_done = True
+            break
+        elif isinstance(event, h11.ConnectionClosed):
+            break
+
+    response_received_at = time.monotonic()
+
+    tls_sock.close()
+
+    return response_headers, body, request_sent_at, response_received_at
+
+
+def web(fqdn: str, port: int = 443) -> Report:
+    ip_list = ips(fqdn)
+    ip = ip_list[0]
+    # ip, port = addr
+
+    # context = ssl.create_default_context()
+    context = ssl._create_unverified_context()
+    context.set_alpn_protocols(["h2", "http/1.1"])
+    sock = socket.socket(socket.AF_INET)
+    tls_sock = context.wrap_socket(sock, server_hostname=fqdn)
+
+    socket_started_at = time.monotonic()
+    tls_sock.connect((ip, port))
+    socket_connected_at = time.monotonic()
+    c = tls_sock.getpeercert(binary_form=True)
+    if c is None:
+        raise Exception("no cert found")
+    cert = x509.load_der_x509_certificate(c, default_backend())
+
+    # Let the server pick; we report whichever protocol was negotiated.
+    negotiated_protocol = tls_sock.selected_alpn_protocol()
+    if negotiated_protocol == "h2":
+        version = HTTPVersion.H2
+        response_headers, body, request_sent_at, response_received_at = _h2_roundtrip(
+            tls_sock, fqdn
+        )
+    elif negotiated_protocol == "http/1.1":
+        version = HTTPVersion.HTTP11
+        response_headers, body, request_sent_at, response_received_at = (
+            _http1_roundtrip(tls_sock, fqdn)
+        )
+    else:
+        raise Exception(f"unexpected ALPN protocol negotiated: {negotiated_protocol!r}")
+
     tls_connect_ms = math.ceil((socket_connected_at - socket_started_at) * MS_PER_S)
     http_response_ms = math.ceil((response_received_at - request_sent_at) * MS_PER_S)
 
     r = Report(
         fqdn=fqdn,
         ips=ip_list,
-        version=HTTPVersion.H2,
+        version=version,
         cert=cert,
         tls_connect_ms=tls_connect_ms,
         http_response_ms=http_response_ms,
