@@ -59,7 +59,7 @@ def bytea_to_str(v: bytes) -> str:
 
 
 def ips(fqdn: str) -> typing.Sequence[str]:
-    run_result = subprocess.run(["dog", "-1", fqdn], capture_output=True)
+    run_result = subprocess.run(["dig", "+short", fqdn], capture_output=True)
     ips = run_result.stdout.split(b"\n")
     ips = filter(is_IPv4, ips)
     ips = list(map(bytea_to_str, ips))
